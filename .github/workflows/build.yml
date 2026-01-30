@@ -1,0 +1,170 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux static (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ x86_64, aarch64 ]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.12.0
+        cache: false
+
+    - name: Build native binary (for tests)
+      if: matrix.arch == 'x86_64'
+      run: |
+        set -eux
+        zig cc \
+          -O3 \
+          -target native \
+          src/kmp.c src/kmp_merge.c \
+          -o kmp_merge
+
+    - name: Run shell tests
+      if: matrix.arch == 'x86_64'
+      run: |
+        set -eux
+        chmod +x tests/*.sh
+        ./tests/test_bytes.sh
+
+    - name: Build static binary
+      run: |
+        set -eux
+
+        if [ "${{ matrix.arch }}" = "x86_64" ]; then
+          zig cc \
+            -O3 -static \
+            -Wno-deprecated-non-prototype \
+            -target x86_64-linux-musl \
+            src/kmp.c src/kmp_merge.c \
+            -o kmp_merge
+        else
+          zig cc \
+            -O3 -static \
+            -Wno-deprecated-non-prototype \
+            -target aarch64-linux-musl \
+            src/kmp.c src/kmp_merge.c \
+            -o kmp_merge
+        fi
+
+    - name: Verify binary
+      run: |
+        file kmp_merge
+        ldd kmp_merge || true
+
+    - name: Upload artifact
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/upload-artifact@v4
+      with:
+        name: kmp_merge-linux-${{ matrix.arch }}
+        path: kmp_merge
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        install: >
+          mingw-w64-x86_64-gcc
+          diffutils
+
+    - name: Build
+      shell: msys2 {0}
+      run: |
+        gcc -O3 -Wall -Wextra -std=c11 \
+            src/kmp.c src/kmp_merge.c \
+            -o kmp_merge.exe
+
+    - name: Run shell tests
+      shell: msys2 {0}
+      run: |
+        chmod +x tests/*.sh
+        ./tests/test_bytes.sh
+
+    - name: Upload artifact
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/upload-artifact@v4
+      with:
+        name: kmp_merge-windows-x86_64.exe
+        path: kmp_merge.exe
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build
+      run: |
+        make clean
+        make CFLAGS="-O3 -Wall -Wextra -std=c11"
+
+    - name: Test
+      run: make test
+
+    - name: Verify binary
+      run: |
+        file kmp_merge
+        otool -L kmp_merge || true
+
+    - name: Upload artifact
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/upload-artifact@v4
+      with:
+        name: kmp_merge-macos
+        path: kmp_merge
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [ linux, windows, macos ]
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+
+    - name: Prepare release assets
+      run: |
+        set -eux
+        mkdir -p release
+
+        cp dist/kmp_merge-linux-x86_64/kmp_merge release/kmp_merge-linux-x86_64
+        cp dist/kmp_merge-linux-aarch64/kmp_merge release/kmp_merge-linux-aarch64
+        cp dist/kmp_merge-macos/kmp_merge release/kmp_merge-macos
+        cp dist/kmp_merge-windows-x86_64.exe/kmp_merge.exe release/kmp_merge-windows-x86_64.exe
+
+        ls -l release
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: release/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
